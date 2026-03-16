@@ -9,7 +9,7 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -64,6 +64,7 @@ interface OperationParams {
 class GodotServer {
   private server: Server;
   private activeProcess: GodotProcess | null = null;
+  private activeWebServer: { process: any; port: number; outputPath: string } | null = null;
   private godotPath: string | null = null;
   private operationsScriptPath: string;
   private validatedPaths: Map<string, boolean> = new Map();
@@ -89,6 +90,8 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'preset': 'preset',
+    'port': 'port',
   };
 
   /**
@@ -913,6 +916,55 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'export_web',
+          description: 'Export a Godot project as a web build (HTML5/WebAssembly). Creates or updates the Web export preset and runs the export. Installs web export templates automatically if missing.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Directory where the web build will be saved (e.g. /tmp/my-game-web). An index.html will be created inside.',
+              },
+              preset: {
+                type: 'string',
+                description: 'Optional: Name of the export preset to use (default: "Web")',
+              },
+            },
+            required: ['projectPath', 'outputPath'],
+          },
+        },
+        {
+          name: 'serve_web',
+          description: 'Start a local HTTP server to play a web build in the browser. Serves files with the required COOP/COEP headers for SharedArrayBuffer support.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              outputPath: {
+                type: 'string',
+                description: 'Directory containing the web build (same outputPath used with export_web)',
+              },
+              port: {
+                type: 'number',
+                description: 'Optional: Port to listen on (default: 8060)',
+              },
+            },
+            required: ['outputPath'],
+          },
+        },
+        {
+          name: 'stop_web_server',
+          description: 'Stop the local web server started by serve_web',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -948,6 +1000,12 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'export_web':
+          return await this.handleExportWeb(request.params.arguments);
+        case 'serve_web':
+          return await this.handleServeWeb(request.params.arguments);
+        case 'stop_web_server':
+          return await this.handleStopWebServer();
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2141,6 +2199,338 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Handle the export_web tool
+   */
+  private async handleExportWeb(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.outputPath) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath and outputPath']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.outputPath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      if (!this.godotPath) {
+        await this.detectGodotPath();
+        if (!this.godotPath) {
+          return this.createErrorResponse(
+            'Could not find a valid Godot executable path',
+            ['Ensure Godot is installed correctly', 'Set GODOT_PATH environment variable']
+          );
+        }
+      }
+
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path points to a directory containing a project.godot file']
+        );
+      }
+
+      // Detect Godot version for template path
+      const { stdout: versionOutput } = await execFileAsync(this.godotPath!, ['--version']);
+      const versionRaw = versionOutput.trim(); // e.g. "4.6.stable.mono.official.89cea1439"
+      const versionMatch = versionRaw.match(/^(\d+\.\d+(?:\.\d+)?)\.(stable|beta|rc|alpha)(\.\w+)?/);
+      if (!versionMatch) {
+        return this.createErrorResponse(`Could not parse Godot version: ${versionRaw}`, []);
+      }
+      const versionBase = versionMatch[1];   // e.g. "4.6"
+      const channel = versionMatch[2];       // e.g. "stable"
+      const isMono = versionRaw.includes('.mono.');
+      const templateDir = join(
+        process.env.HOME || '~',
+        'Library', 'Application Support', 'Godot', 'export_templates',
+        `${versionBase}.${channel}${isMono ? '.mono' : ''}`
+      );
+
+      // Check for web templates; download if missing
+      const webTemplateFile = join(templateDir, 'web_release.zip');
+      if (!existsSync(webTemplateFile)) {
+        const monoSuffix = isMono ? '_mono' : '';
+        const versionTag = `${versionBase}-${channel}`;
+        const templateUrl = `https://github.com/godotengine/godot/releases/download/${versionTag}/Godot_v${versionBase}-${channel}${monoSuffix}_export_templates.tpz`;
+
+        this.logDebug(`Web templates not found. Downloading from: ${templateUrl}`);
+
+        // Download the .tpz (zip) and extract just the web templates
+        const tpzPath = join(templateDir, '_web_templates_download.tpz');
+        mkdirSync(templateDir, { recursive: true });
+
+        try {
+          await execFileAsync('curl', ['-L', '-o', tpzPath, templateUrl]);
+          // Extract only web_* files from the tpz (it's a zip with a templates/ prefix)
+          await execFileAsync('unzip', ['-o', tpzPath, 'templates/web*', '-d', join(templateDir, '_extract')]);
+          // Move web templates into the template dir
+          const extractedDir = join(templateDir, '_extract', 'templates');
+          if (existsSync(extractedDir)) {
+            const { stdout: lsOut } = await execFileAsync('ls', [extractedDir]);
+            const webFiles = lsOut.split('\n').filter(f => f.startsWith('web'));
+            for (const f of webFiles) {
+              await execFileAsync('mv', [join(extractedDir, f), join(templateDir, f)]);
+            }
+            await execFileAsync('rm', ['-rf', join(templateDir, '_extract'), tpzPath]);
+          }
+        } catch (dlError: any) {
+          return this.createErrorResponse(
+            `Failed to download web export templates: ${dlError?.message || 'Unknown error'}`,
+            [
+              `Manually download: ${templateUrl}`,
+              `Extract the web_*.zip files into: ${templateDir}`,
+              'Or install via Godot editor: Editor > Manage Export Templates',
+            ]
+          );
+        }
+      }
+
+      // Ensure output directory exists
+      mkdirSync(args.outputPath, { recursive: true });
+
+      // Ensure a "Web" (or custom named) export preset exists in export_presets.cfg
+      const presetName = args.preset || 'Web';
+      const presetsPath = join(args.projectPath, 'export_presets.cfg');
+      let presetsContent = existsSync(presetsPath) ? readFileSync(presetsPath, 'utf8') : '';
+
+      if (!presetsContent.includes(`name="${presetName}"`)) {
+        // Count existing presets to get next index
+        const existingCount = (presetsContent.match(/^\[preset\.\d+\]/gm) || []).length;
+        const webPreset = `
+[preset.${existingCount}]
+
+name="${presetName}"
+platform="Web"
+runnable=true
+dedicated_server=false
+custom_features=""
+export_filter="all_resources"
+include_filter=""
+exclude_filter=""
+export_path=""
+patches=PackedStringArray()
+patch_delta_encoding=false
+patch_delta_compression_level_zstd=19
+patch_delta_min_reduction=0.1
+patch_delta_include_filters="*"
+patch_delta_exclude_filters=""
+encryption_include_filters=""
+encryption_exclude_filters=""
+seed=0
+encrypt_pck=false
+encrypt_directory=false
+script_export_mode=2
+
+[preset.${existingCount}.options]
+
+custom_template/debug=""
+custom_template/release=""
+variant/extensions_support=false
+vram_texture_compression/for_desktop=true
+vram_texture_compression/for_mobile=false
+html/export_icon=true
+html/custom_html_shell=""
+html/head_include=""
+html/canvas_resize_policy=2
+html/focus_canvas_on_start=true
+html/experimental_virtual_keyboard=false
+progressive_web_app/enabled=false
+progressive_web_app/offline_page=""
+progressive_web_app/display=1
+progressive_web_app/orientation=0
+progressive_web_app/icon_144x144=""
+progressive_web_app/icon_180x180=""
+progressive_web_app/icon_512x512=""
+progressive_web_app/background_color=Color(0, 0, 0, 1)
+`;
+        writeFileSync(presetsPath, presetsContent + webPreset, 'utf8');
+        this.logDebug(`Created Web export preset in ${presetsPath}`);
+      }
+
+      // Run the export
+      const outputHtml = join(args.outputPath, 'index.html');
+      this.logDebug(`Exporting web build to: ${outputHtml}`);
+      const { stdout, stderr } = await execFileAsync(
+        this.godotPath!,
+        ['--headless', '--path', args.projectPath, '--export-release', presetName, outputHtml],
+        { maxBuffer: 50 * 1024 * 1024 }
+      );
+
+      if (!existsSync(outputHtml)) {
+        return this.createErrorResponse(
+          `Export appeared to complete but index.html was not created`,
+          [
+            'Check that the Web export preset is configured correctly',
+            `stderr: ${stderr}`,
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Web build exported successfully to: ${args.outputPath}\n\nUse serve_web with outputPath "${args.outputPath}" to play it in the browser.\n\nOutput: ${stdout || '(none)'}\n${stderr ? `Warnings: ${stderr}` : ''}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to export web build: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot is installed and GODOT_PATH is set correctly',
+          'Verify web export templates are installed',
+          'Check that the project has no export errors',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the serve_web tool
+   */
+  private async handleServeWeb(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.outputPath) {
+      return this.createErrorResponse(
+        'outputPath is required',
+        ['Provide the directory containing the web build (same path used with export_web)']
+      );
+    }
+
+    if (!this.validatePath(args.outputPath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const indexHtml = join(args.outputPath, 'index.html');
+    if (!existsSync(indexHtml)) {
+      return this.createErrorResponse(
+        `No web build found at: ${args.outputPath}`,
+        ['Run export_web first to create a web build']
+      );
+    }
+
+    if (this.activeWebServer) {
+      this.activeWebServer.process.kill();
+      this.activeWebServer = null;
+    }
+
+    const port = typeof args.port === 'number' ? args.port : 8060;
+    const outputPath = args.outputPath;
+
+    // Inline Node.js HTTP server with required COOP/COEP headers
+    const serverScript = `
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const dir = ${JSON.stringify(outputPath)};
+const port = ${port};
+const mime = {
+  '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm',
+  '.pck': 'application/octet-stream', '.png': 'image/png', '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml', '.json': 'application/json', '.audio.worklet.js': 'text/javascript',
+};
+http.createServer((req, res) => {
+  const urlPath = req.url.split('?')[0];
+  const filePath = path.join(dir, urlPath === '/' ? 'index.html' : urlPath);
+  const ext = path.extname(filePath);
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  fs.readFile(filePath, (err, data) => {
+    if (err) { res.writeHead(404); res.end('Not found'); return; }
+    res.writeHead(200, { 'Content-Type': mime[ext] || 'application/octet-stream' });
+    res.end(data);
+  });
+}).listen(port, '127.0.0.1', () => {
+  process.stdout.write(JSON.stringify({ started: true, port }) + '\\n');
+});
+`;
+
+    const serverProcess = spawn('node', ['-e', serverScript], { stdio: 'pipe' });
+
+    return new Promise<any>((resolve) => {
+      let resolved = false;
+
+      serverProcess.stdout?.on('data', (data: Buffer) => {
+        if (resolved) return;
+        try {
+          const msg = JSON.parse(data.toString().trim());
+          if (msg.started) {
+            resolved = true;
+            this.activeWebServer = { process: serverProcess, port, outputPath };
+            resolve({
+              content: [{
+                type: 'text',
+                text: `Web server running at http://127.0.0.1:${port}\n\nOpen that URL in your browser to play the game.\nUse stop_web_server to stop it.`,
+              }],
+            });
+          }
+        } catch (_) {}
+      });
+
+      serverProcess.stderr?.on('data', (data: Buffer) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(this.createErrorResponse(
+          `Web server failed to start: ${data.toString()}`,
+          [`Check if port ${port} is already in use`, 'Try a different port']
+        ));
+      });
+
+      serverProcess.on('error', (err: Error) => {
+        if (resolved) return;
+        resolved = true;
+        resolve(this.createErrorResponse(
+          `Failed to start web server: ${err.message}`,
+          ['Ensure Node.js is installed and available in PATH']
+        ));
+      });
+
+      // Timeout fallback
+      setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          resolve(this.createErrorResponse('Web server timed out on startup', []));
+        }
+      }, 5000);
+    });
+  }
+
+  /**
+   * Handle the stop_web_server tool
+   */
+  private async handleStopWebServer() {
+    if (!this.activeWebServer) {
+      return this.createErrorResponse(
+        'No web server is currently running',
+        ['Use serve_web to start a web server first']
+      );
+    }
+
+    const { port, outputPath } = this.activeWebServer;
+    this.activeWebServer.process.kill();
+    this.activeWebServer = null;
+
+    return {
+      content: [{
+        type: 'text',
+        text: `Web server stopped (was serving ${outputPath} on port ${port})`,
+      }],
+    };
   }
 
   /**
