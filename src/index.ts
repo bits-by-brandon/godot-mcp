@@ -2259,9 +2259,10 @@ class GodotServer {
       // Check for web templates; download if missing
       const webTemplateFile = join(templateDir, 'web_release.zip');
       if (!existsSync(webTemplateFile)) {
-        const monoSuffix = isMono ? '_mono' : '';
+        // Web templates are not included in mono export templates (no C# web support in Godot 4.x).
+        // Always download the standard (non-mono) templates to get web files.
         const versionTag = `${versionBase}-${channel}`;
-        const templateUrl = `https://github.com/godotengine/godot/releases/download/${versionTag}/Godot_v${versionBase}-${channel}${monoSuffix}_export_templates.tpz`;
+        const templateUrl = `https://github.com/godotengine/godot/releases/download/${versionTag}/Godot_v${versionBase}-${channel}_export_templates.tpz`;
 
         this.logDebug(`Web templates not found. Downloading from: ${templateUrl}`);
 
@@ -2270,18 +2271,24 @@ class GodotServer {
         mkdirSync(templateDir, { recursive: true });
 
         try {
-          await execFileAsync('curl', ['-L', '-o', tpzPath, templateUrl]);
-          // Extract only web_* files from the tpz (it's a zip with a templates/ prefix)
-          await execFileAsync('unzip', ['-o', tpzPath, 'templates/web*', '-d', join(templateDir, '_extract')]);
-          // Move web templates into the template dir
-          const extractedDir = join(templateDir, '_extract', 'templates');
+          await execFileAsync('curl', ['-L', '-o', tpzPath, templateUrl], { maxBuffer: 50 * 1024 * 1024 });
+          // List files in the tpz to find web template entries (avoids shell glob issues)
+          const { stdout: zipList } = await execFileAsync('unzip', ['-Z1', tpzPath]);
+          const webEntries = zipList.split('\n').filter(e => /templates\/web/.test(e));
+          if (webEntries.length === 0) {
+            throw new Error('No web template files found in the downloaded archive');
+          }
+          const extractDir = join(templateDir, '_extract');
+          // Extract only the web entries explicitly
+          await execFileAsync('unzip', ['-o', tpzPath, ...webEntries, '-d', extractDir]);
+          const extractedDir = join(extractDir, 'templates');
           if (existsSync(extractedDir)) {
             const { stdout: lsOut } = await execFileAsync('ls', [extractedDir]);
             const webFiles = lsOut.split('\n').filter(f => f.startsWith('web'));
             for (const f of webFiles) {
               await execFileAsync('mv', [join(extractedDir, f), join(templateDir, f)]);
             }
-            await execFileAsync('rm', ['-rf', join(templateDir, '_extract'), tpzPath]);
+            await execFileAsync('rm', ['-rf', extractDir, tpzPath]);
           }
         } catch (dlError: any) {
           return this.createErrorResponse(
